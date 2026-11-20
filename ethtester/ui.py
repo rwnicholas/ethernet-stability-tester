@@ -210,8 +210,13 @@ class CursesTUI:
         if not gw or not gw.available:
             scr.addstr("N/A", c_yellow)
         else:
-            tgt = gw.ip or gw.host or "resolving..."
-            scr.addstr(f"{tgt}")
+            if gw.ip:
+                tgt = gw.ip
+                scr.addstr(f"{tgt}")
+            elif link_state != "UP":
+                scr.addstr("waiting (Link DOWN)", c_yellow)
+            else:
+                scr.addstr("waiting for DHCP / IP...", c_yellow)
             scr.addstr(4, 40, "Packet Loss   : ")
             loss_pct = (gw.lost * 100.0 / gw.sent) if gw.sent else 0.0
             loss_str = f"{loss_pct:.2f}% ({gw.lost}/{gw.sent})"

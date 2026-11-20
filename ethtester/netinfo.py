@@ -444,12 +444,62 @@ def read_routes(p) -> List[Dict]:
 
 
 def default_gateway(p, iface: str) -> Optional[str]:
-    """IPv4 default gateway reachable through *iface* (lowest metric)."""
-    cands = [r for r in read_routes(p) if r["iface"] == iface and r["dst"] == "0.0.0.0"
-             and r["mask"] == "0.0.0.0" and r["flags"] & 0x2 and r["flags"] & 0x1]
-    if not cands:
-        return None
-    return sorted(cands, key=lambda r: r["metric"])[0]["gw"]
+    """IPv4 default gateway reachable through *iface* (lowest metric).
+    Uses multiple detection strategies: /proc/net/route, ip route, subnet matching,
+    and system fallback."""
+    # Strategy 1: Explicit default route on iface in /proc/net/route
+    cands = [
+        r
+        for r in read_routes(p)
+        if r["iface"] == iface
+        and r["dst"] == "0.0.0.0"
+        and r["mask"] == "0.0.0.0"
+        and r["flags"] & 0x2
+        and r["flags"] & 0x1
+    ]
+    if cands:
+        return sorted(cands, key=lambda r: r["metric"])[0]["gw"]
+
+    # Strategy 2: `ip -4 route show dev <iface>`
+    if p.which("ip"):
+        r = p.run(["ip", "-4", "route", "show", "default", "dev", iface], timeout=5)
+        if r.ok and r.out.strip():
+            m = re.search(r"\bvia\s+(\d+\.\d+\.\d+\.\d+)", r.out)
+            if m:
+                return m.group(1)
+
+    # Strategy 3: Check if iface has an IPv4 address; if so, match against system default routes
+    addrs = iface_addresses(p, iface).get("ipv4", [])
+    if addrs:
+        for cidr in addrs:
+            try:
+                iface_net = ipaddress.IPv4Interface(cidr).network
+                # Check all default routes on the system
+                for r in read_routes(p):
+                    if r["dst"] == "0.0.0.0" and r["flags"] & 0x2 and r["flags"] & 0x1:
+                        gw_ip = ipaddress.IPv4Address(r["gw"])
+                        if gw_ip in iface_net:
+                            return str(gw_ip)
+                # Fallback: router is typically .1 in standard home subnets (/24)
+                first_host = str(list(iface_net.hosts())[0])
+                if first_host not in [a.split("/")[0] for a in addrs]:
+                    return first_host
+            except (ValueError, IndexError):
+                continue
+
+    # Strategy 4: If system has a single default gateway and link is UP, try it
+    sys_defaults = [
+        r
+        for r in read_routes(p)
+        if r["dst"] == "0.0.0.0"
+        and r["mask"] == "0.0.0.0"
+        and r["flags"] & 0x2
+        and r["flags"] & 0x1
+    ]
+    if len(sys_defaults) == 1:
+        return sys_defaults[0]["gw"]
+
+    return None
 
 
 def route_iface(p, target: str) -> Optional[str]:
