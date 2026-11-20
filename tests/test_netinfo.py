@@ -71,6 +71,22 @@ Standard stats for eth0:
         self.assertIsNone(parse_speed("Unknown!"))
         self.assertIsNone(parse_speed(None))
 
+    def test_ethtool_without_binary_fallback(self):
+        from ethtester.netinfo import Ethtool
+        from ethtester.sim import SimulatedPlatform
+
+        p = SimulatedPlatform(scenario="default")
+        # Pretend ethtool binary does not exist
+        et = Ethtool(p, "eth0")
+        et.has_binary = False
+        settings, err = et.settings()
+        self.assertIsInstance(settings, dict)
+        self.assertEqual(settings.get("speed_mbps"), 1000)
+        self.assertEqual(settings.get("link_detected"), "yes")
+
+        eee, eee_err = et.eee()
+        self.assertIn("N/A", eee_err)
+
 
 if __name__ == "__main__":
     unittest.main()

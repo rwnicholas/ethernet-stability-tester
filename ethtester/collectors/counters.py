@@ -182,19 +182,16 @@ class DriverStatsCollector(Collector):
         return d, derr, st, serr
 
     def setup(self):
-        if not self.et.available:
-            self.mark_unavailable("ethtool not installed")
-            return
         d, self.driver_err = self.et.driver_stats()
         st, self.std_err = self.et.standard_stats()
         self.driver_ok, self.std_ok = d is not None, st is not None
         if not self.driver_ok and not self.std_ok:
-            self.mark_unavailable("ethtool -S: %s" % self.driver_err)
+            self.mark_unavailable("Driver statistics: %s" % (self.driver_err or "not supported by driver"))
             return
         if not self.std_ok:
             self.emit("METRIC_UNAVAILABLE", "IEEE standard statistics (ethtool -S --all-groups): %s" % self.std_err)
         if not self.driver_ok:
-            self.emit("METRIC_UNAVAILABLE", "Driver statistics (ethtool -S): %s" % self.driver_err, SEV_WARN)
+            self.emit("METRIC_UNAVAILABLE", "Driver statistics: %s" % self.driver_err, SEV_WARN)
         d, st = d or {}, st or {}
         self.initial_raw = {"driver": d or None, "standard": st or None}
         self.cs_driver.update(d)

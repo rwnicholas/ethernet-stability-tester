@@ -1,6 +1,8 @@
 """Interface detection, read-only ethtool queries and parsing, gateway / route discovery."""
 from __future__ import annotations
 
+import array
+import fcntl
 import ipaddress
 import os
 import re
@@ -11,6 +13,92 @@ from typing import Dict, List, Optional, Tuple
 from .util import to_int
 
 ARPHRD_ETHER = "1"
+
+# Linux kernel SIOCETHTOOL ioctl constants
+SIOCETHTOOL = 0x8946
+ETHTOOL_GSET = 0x00000001
+ETHTOOL_GDRVINFO = 0x00000003
+ETHTOOL_GLINK = 0x0000000a
+ETHTOOL_GSTRINGS = 0x0000001b
+ETHTOOL_GSTATS = 0x0000001d
+ETH_SS_STATS = 1
+ETH_GSTRING_LEN = 32
+
+
+def ioctl_drvinfo(iface: str) -> Optional[Dict[str, str]]:
+    """Query driver information directly from the kernel via SIOCETHTOOL ioctl."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            drvinfo = struct.pack("I", ETHTOOL_GDRVINFO) + b"\x00" * (32 * 5 + 12 + 4 * 5)
+            buf = array.array("B", drvinfo)
+            buf_addr, _ = buf.buffer_info()
+            ifreq = struct.pack("16sP", iface.encode("ascii", "replace")[:15], buf_addr)
+            fcntl.ioctl(s.fileno(), SIOCETHTOOL, ifreq)
+        cmd, drv, ver, fw, bus, erom, res, n_priv, n_stats, tst, ee, reg = struct.unpack(
+            "I32s32s32s32s32s12sIIIII", bytes(buf)
+        )
+        return {
+            "driver": drv.split(b"\0")[0].decode("utf-8", "replace") or None,
+            "version": ver.split(b"\0")[0].decode("utf-8", "replace") or None,
+            "firmware-version": fw.split(b"\0")[0].decode("utf-8", "replace") or None,
+            "bus-info": bus.split(b"\0")[0].decode("utf-8", "replace") or None,
+            "n_stats": n_stats,
+        }
+    except Exception:
+        return None
+
+
+def ioctl_driver_stats(iface: str) -> Tuple[Optional[Dict[str, int]], str]:
+    """Query driver statistics directly from the kernel via SIOCETHTOOL ioctl (ethtool -S equivalent)."""
+    try:
+        info = ioctl_drvinfo(iface)
+        if not info or not info.get("n_stats"):
+            return None, "driver exposes no statistics"
+        n_stats = info["n_stats"]
+
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            # 1. Fetch string names
+            gstrings = struct.pack("III", ETHTOOL_GSTRINGS, ETH_SS_STATS, n_stats) + b"\x00" * (n_stats * ETH_GSTRING_LEN)
+            buf_s = array.array("B", gstrings)
+            buf_s_addr, _ = buf_s.buffer_info()
+            ifreq_s = struct.pack("16sP", iface.encode("ascii", "replace")[:15], buf_s_addr)
+            fcntl.ioctl(s.fileno(), SIOCETHTOOL, ifreq_s)
+            raw_names = bytes(buf_s[12:])
+            names = [
+                raw_names[i * ETH_GSTRING_LEN : (i + 1) * ETH_GSTRING_LEN].split(b"\0")[0].decode("latin1", "replace").strip()
+                for i in range(n_stats)
+            ]
+
+            # 2. Fetch statistics values
+            gstats = struct.pack("II", ETHTOOL_GSTATS, n_stats) + b"\x00" * (n_stats * 8)
+            buf_g = array.array("B", gstats)
+            buf_g_addr, _ = buf_g.buffer_info()
+            ifreq_g = struct.pack("16sP", iface.encode("ascii", "replace")[:15], buf_g_addr)
+            fcntl.ioctl(s.fileno(), SIOCETHTOOL, ifreq_g)
+
+        vals = struct.unpack(f"{n_stats}Q", bytes(buf_g[8:]))
+        return {name: val for name, val in zip(names, vals) if name}, ""
+    except Exception as e:
+        return None, str(e)
+
+
+def ioctl_settings(iface: str) -> Optional[Dict[str, Any]]:
+    """Query speed/duplex/autoneg directly from the kernel via SIOCETHTOOL ioctl."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            buf = array.array("B", b"\x00" * 128)
+            struct.pack_into("I", buf, 0, ETHTOOL_GSET)
+            buf_addr, _ = buf.buffer_info()
+            ifreq = struct.pack("16sP", iface.encode("ascii", "replace")[:15], buf_addr)
+            fcntl.ioctl(s.fileno(), SIOCETHTOOL, ifreq)
+        vals = struct.unpack_from("IIIHBBBBBB", buf, 0)
+        sp = vals[3]
+        speed_mbps = sp if sp != 65535 else None
+        duplex = "full" if vals[4] == 1 else ("half" if vals[4] == 0 else None)
+        autoneg = "on" if vals[8] == 1 else "off"
+        return {"speed_mbps": speed_mbps, "duplex": duplex, "autoneg": autoneg}
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------- ethtool parsing
@@ -106,15 +194,17 @@ def summarize_settings(kv: Dict[str, str]) -> Dict:
 
 
 class Ethtool:
-    """Read-only ethtool queries.  Never issues a 'set' operation."""
+    """Read-only ethtool queries. Never issues a 'set' operation.
+    Falls back to kernel ioctl (SIOCETHTOOL) and sysfs when ethtool binary is absent."""
 
     def __init__(self, platform, iface: str):
         self.p = platform
         self.iface = iface
-        self.available = platform.which("ethtool")
+        self.has_binary = platform.which("ethtool")
+        self.available = self.has_binary or (platform.name != "simulated")
 
     def _run(self, args):
-        if not self.available:
+        if not self.has_binary:
             return None, "ethtool not installed"
         r = self.p.run(["ethtool"] + args, timeout=10)
         if r.ok and r.out.strip():
@@ -122,46 +212,107 @@ class Ethtool:
         return None, r.error_text() if not r.ok else "no output"
 
     def settings(self) -> Tuple[Dict, str]:
-        out, err = self._run([self.iface])
-        if out is None:
-            return {}, err
-        kv = parse_ethtool_kv(out)
-        info = summarize_settings(kv)
-        # link-down event counter (ethtool >= 5.x with driver support)
-        out2, _ = self._run(["-I", self.iface])
-        if out2:
-            kv2 = parse_ethtool_kv(out2)
-            for k, v in kv2.items():
-                if k.lower() == "link down events":
-                    info["link_down_events"] = to_int(v)
+        if self.has_binary:
+            out, err = self._run([self.iface])
+            if out is not None:
+                kv = parse_ethtool_kv(out)
+                info = summarize_settings(kv)
+                # link-down event counter (ethtool >= 5.x with driver support)
+                out2, _ = self._run(["-I", self.iface])
+                if out2:
+                    kv2 = parse_ethtool_kv(out2)
+                    for k, v in kv2.items():
+                        if k.lower() == "link down events":
+                            info["link_down_events"] = to_int(v)
+                return info, ""
+        # Kernel ioctl + sysfs fallback
+        return self._sysfs_and_ioctl_settings()
+
+    def _sysfs_and_ioctl_settings(self) -> Tuple[Dict, str]:
+        sp = to_int(self.p.read(self.iface, "speed"))
+        if sp is not None and sp <= 0:
+            sp = None
+        duplex = self.p.read(self.iface, "duplex")
+        if duplex in (None, "", "unknown"):
+            duplex = None
+        carrier = self.p.read(self.iface, "carrier")
+        link_det = "yes" if carrier == "1" else ("no" if carrier == "0" else None)
+
+        info = {
+            "speed_mbps": sp,
+            "speed_raw": f"{sp}Mb/s" if sp else None,
+            "duplex": duplex.capitalize() if duplex else None,
+            "autoneg": None,
+            "port": None,
+            "mdix": None,
+            "link_detected": link_det,
+            "supported_modes": None,
+            "advertised_modes": None,
+            "partner_advertised_modes": None,
+            "partner_autoneg": None,
+            "advertised_pause": None,
+            "partner_pause": None,
+            "master_slave": None,
+            "link_down_events": None,
+        }
+        gset = ioctl_settings(self.iface)
+        if gset:
+            if gset.get("autoneg"):
+                info["autoneg"] = gset["autoneg"]
+            if not info["duplex"] and gset.get("duplex"):
+                info["duplex"] = gset["duplex"].capitalize()
+            if not info["speed_mbps"] and gset.get("speed_mbps"):
+                info["speed_mbps"] = gset["speed_mbps"]
+                info["speed_raw"] = f"{gset['speed_mbps']}Mb/s"
         return info, ""
 
     def driver_info(self) -> Tuple[Dict, str]:
-        out, err = self._run(["-i", self.iface])
-        return (parse_ethtool_kv(out), "") if out else ({}, err)
+        if self.has_binary:
+            out, err = self._run(["-i", self.iface])
+            if out:
+                return parse_ethtool_kv(out), ""
+        # Kernel ioctl fallback
+        info = ioctl_drvinfo(self.iface)
+        if info:
+            return info, ""
+        return {}, "ethtool driver info unavailable"
 
     def eee(self) -> Tuple[Dict, str]:
-        out, err = self._run(["--show-eee", self.iface])
-        return (parse_ethtool_kv(out), "") if out else ({}, err)
+        if self.has_binary:
+            out, err = self._run(["--show-eee", self.iface])
+            if out:
+                return parse_ethtool_kv(out), ""
+        return {}, "N/A (ethtool binary not installed)"
 
     def pause(self) -> Tuple[Dict, str]:
-        out, err = self._run(["-a", self.iface])
-        return (parse_ethtool_kv(out), "") if out else ({}, err)
+        if self.has_binary:
+            out, err = self._run(["-a", self.iface])
+            if out:
+                return parse_ethtool_kv(out), ""
+        return {}, "N/A (ethtool binary not installed)"
 
     def driver_stats(self) -> Tuple[Optional[Dict[str, int]], str]:
-        out, err = self._run(["-S", self.iface])
-        if out is None:
-            return None, err
-        st = parse_ethtool_stats(out)
-        return (st, "") if st else (None, "driver exposes no statistics")
+        if self.has_binary:
+            out, err = self._run(["-S", self.iface])
+            if out is not None:
+                st = parse_ethtool_stats(out)
+                if st:
+                    return st, ""
+        # Kernel ioctl fallback
+        st, err = ioctl_driver_stats(self.iface)
+        if st:
+            return st, ""
+        return None, err or "driver exposes no statistics"
 
     def standard_stats(self) -> Tuple[Optional[Dict[str, int]], str]:
         """IEEE 802.3 / RMON standard counters (ethtool >= 5.13, driver support required)."""
-        out, err = self._run(["-S", self.iface, "--all-groups"])
-        if out is None:
-            return None, err
-        st = parse_ethtool_stats(out)
-        return (st, "") if st else (None, "driver exposes no standard statistics groups")
+        if self.has_binary:
+            out, err = self._run(["-S", self.iface, "--all-groups"])
+            if out is not None:
+                st = parse_ethtool_stats(out)
+                if st:
+                    return st, ""
+        return None, "driver exposes no standard statistics groups"
 
 
 # ---------------------------------------------------------------------------- detection

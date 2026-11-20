@@ -11,7 +11,7 @@ import threading
 from typing import Iterator, List, Optional, Tuple
 
 from .probes import open_prober
-from .util import CmdResult, c_env, run_cmd
+from .util import CmdResult, c_env, find_tool, run_cmd
 
 
 class KernelFollower:
@@ -83,7 +83,7 @@ class LinuxPlatform:
 
     # ---- commands ---------------------------------------------------------------------
     def which(self, tool: str) -> bool:
-        return shutil.which(tool) is not None
+        return find_tool(tool) is not None
 
     def run(self, cmd: List[str], timeout: float = 10.0) -> CmdResult:
         return run_cmd(cmd, timeout)

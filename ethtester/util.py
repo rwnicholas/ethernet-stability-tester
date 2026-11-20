@@ -115,11 +115,20 @@ class CmdResult:
         return msg[-1] if msg else "exit code %s" % self.rc
 
 
+def find_tool(tool: str) -> Optional[str]:
+    """Find binary in system PATH, including standard sbin directories common on SteamOS/Linux."""
+    path = os.environ.get("PATH", "")
+    extended_path = path + ":/usr/local/sbin:/usr/sbin:/sbin"
+    return shutil.which(tool, path=extended_path) or shutil.which(tool)
+
+
 def run_cmd(cmd: List[str], timeout: float = 10.0) -> CmdResult:
-    if shutil.which(cmd[0]) is None:
+    bin_path = find_tool(cmd[0])
+    if bin_path is None:
         return CmdResult(cmd, missing=True)
+    full_cmd = [bin_path] + cmd[1:]
     try:
-        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        p = subprocess.run(full_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                            timeout=timeout, env=c_env(), stdin=subprocess.DEVNULL)
         return CmdResult(cmd, p.returncode, p.stdout, p.stderr)
     except subprocess.TimeoutExpired:

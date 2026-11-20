@@ -83,10 +83,12 @@ chmod +x ethernet_stability_tester.py
 ```
 
 ### 4. Verify System Tools
-The Steam Deck comes with Python 3, `ip`, and `ping` pre-installed. `ethtool` is typically present. Verify:
+The Steam Deck comes with Python 3, `ip`, and `ping` pre-installed.
+- **No `ethtool` installation needed**: If `ethtool` is missing from `$PATH` (common on stock SteamOS), the tester automatically queries the Linux kernel directly via unprivileged `SIOCETHTOOL` ioctls and `/sys/class/net/` for link status, speed, duplex, driver info, and driver error counters.
+- To verify your environment:
 ```bash
 python3 --version
-which ethtool ping ip journalctl
+which ping ip journalctl
 ```
 *(Optional)* If you wish to test local network throughput, install `iperf3` (or run it from a container/flatpak). Basic stability testing does not require `iperf3`.
 
